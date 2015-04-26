@@ -1,0 +1,146 @@
+---
+title: "Machine Learning Project"
+author: "pw"
+date: "Saturday, April 25, 2015"
+output: html_document
+---
+
+```{r loadpackages, echo=FALSE}
+library(caret); library(doParallel); library(plyr); library(dplyr); library(rattle)
+```
+
+##Executive Summary
+This note examines a [Weight Lifting Exercise](http://groupware.les.inf.puc-rio.br/har) dataset and describes the process of selecting and fitting a model to predict common weight lifting errors. We begin by selecting features based on their availability in the final testing dataset, and then eliminate variables that exhibit high correlation. We ultimately select a random forest model, which calibrates to an out of bag error estimate of 1.37% on the training data. Our final model measures an out of sample error rate of 0.85%.
+
+##Data Loading and Partitioning
+The Human Activity Recognition [training](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and [testing](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv) datasets are available in csv format.
+```{r loaddata}
+# download training and test data
+if (!file.exists("./pml-training.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "./pml-training.csv")
+}
+if (!file.exists("./pml-testing.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "./pml-testing.csv")
+}
+
+# read into memory
+modelBuild <- read.csv("./pml-training.csv")
+testCases <- read.csv("./pml-testing.csv")
+```
+
+We partition the data into 70% training and 30% testing sets to calibrate our models and ensure we have a sufficiently large testing set to obtain an out-of-sample error rate.
+
+```{r prepdata}
+# partition data into training and test sets
+set.seed(1)
+inTrain <- createDataPartition(y=modelBuild$classe, p=0.7, list=FALSE)
+
+training <- modelBuild[inTrain,]
+testing <- modelBuild[-inTrain,]
+
+```
+
+###Feature selection
+We take three basic approaches to narrowing the feature set:
+1. Remove summary statistics (e.g., avg, max, min, var, etc.), as these are not available in the final 20 cases that we must ultimately predict.
+2. Remove metadata. In this case, the data is intuitively unrelated to the problem we are trying to solve - predicting weight lifting quality based upon sensor-obtained data.
+3. Remove highly correlated variables. Here we use a threshold of 70%, and eliminate one the highly correlated variables from our feature set.
+
+This process yields a residual 30 predictors.
+
+```{r selectfeatures}
+# remove summary stats: avg, max, min, var, stddev, kurtosis, skewness, amplitude; 
+# as these are not always available in our training set, and are not available in our 20 test cases
+summstats <- grep("avg|max|min|var|stddev|kurtosis|skewness|amplitude",colnames(training))
+
+# remove metadata, which will not be useful for prediction
+metacols <- grep("user|timestamp|window",colnames(training))
+
+# recreate training set, also excluding col 1, which is simply a row number
+training <- training[,-c(1,metacols,summstats)]
+
+# find highly correlated variables to further pare back features
+featureCM <- cor(training[,-grep("classe",colnames(training))])
+
+# pull out variables with correlation above .7
+highCor <- findCorrelation(featureCM, cutoff=.7)
+
+training <- training[,-highCor]
+
+```
+
+##Model Selection
+Since our problem centers upon activity classification, we explore the use of tree-based models. We first attempt to fit a tree model using the rPart method, since this provides a highly interpretable output. 
+
+```{r treeModFit}
+# first specify fit control to handle cross validation
+fitControlTree <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           ## repeated ten times
+                           repeats = 10)
+
+# try to set up parallel processing to improve performance
+cluster <- makeCluster(detectCores() - 1)
+    registerDoParallel(cluster)
+
+# set seed and fit rpart classification tree model
+set.seed(100)
+modFitTree <- train(classe ~ ., method="rpart",
+                    trControl = fitControlTree,
+                    data=training)
+
+stopCluster(cluster)
+setDefaultCluster(cl = NULL)
+
+# print model output & tuning statistics
+print(modFitTree)
+fancyRpartPlot(modFitTree$finalModel, main = "Classification Tree Model")
+```
+
+Unfortunately (and perhaps unsurprisingly), the classification accuracy is extremely low, even in the training set. 
+
+We shift to a more sophisticated random forest model, and tailor some of the parameters to manage run time performance (e.g. limit mtry to 6). We specify k-folds cross validation with 5 folds as a means of estimating error, and run a confusion matrix on the training data.
+
+```{r rfModFit}
+# first specify fit control - we will use kfolds cross-validation and mtry=6 for performance
+fitControlRf <- trainControl(method = "cv", number = 5)
+rfGrid <- expand.grid(mtry = 6)
+
+# try to set up parallel processing to improve performance
+cluster <- makeCluster(detectCores() - 1)
+    registerDoParallel(cluster)
+
+# set seed and fit rpart classification tree model
+set.seed(101)
+modFitRf <- train(classe ~ ., method="rf",
+                    trControl = fitControlRf,
+                    data=training, prox=TRUE,
+                    tuneGrid = rfGrid, ntree=200, 
+                    allowParallel = TRUE)
+
+stopCluster(cluster)
+setDefaultCluster(cl = NULL)
+
+# print model output & tuning statistics
+print(modFitRf)
+
+print(modFitRf$finalModel)
+
+confusionMatrix(training$classe, predict(modFitRf,training))
+
+```
+
+The confusion matrix indicates an extremely accurate model, with 100% accuracy on the training set. The out-of-bag error estimate of the random forest model (a reasonable estimate of out of sample error) is 1.37%.
+
+We then run this caliabrated model against the testing set to obtain a separate estimation of the out of sample error.
+
+```{r confMat}
+
+# show confusion matrix for test set
+cm <- confusionMatrix(testing$classe,  predict(modFitRf,testing))
+print(cm)
+```
+
+The testing prediction confusion matrix indicates an out-of-sample error of `r 1-cm$overall[1]`.
+
